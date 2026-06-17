@@ -1,0 +1,108 @@
+{
+  "data_path": "new.mat",
+  "data_key": "data",
+  "data_shape": [
+    50,
+    50,
+    6,
+    60
+  ],
+  "train_rows": 720000,
+  "test_rows": 180000,
+  "train_steps": 48,
+  "reference_points": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      49
+    ],
+    [
+      49,
+      0
+    ],
+    [
+      49,
+      49
+    ]
+  ],
+  "model_config": {
+    "width": 512,
+    "depth": 4,
+    "feature_cols": [
+      "time",
+      "freq",
+      "target_x",
+      "target_y",
+      "ref_signal_0",
+      "ref_dx_0",
+      "ref_dy_0",
+      "ref_signal_1",
+      "ref_dx_1",
+      "ref_dy_1",
+      "ref_signal_2",
+      "ref_dx_2",
+      "ref_dy_2",
+      "ref_signal_3",
+      "ref_dx_3",
+      "ref_dy_3"
+    ],
+    "target_col": "target",
+    "observation_model": "NORMAL",
+    "timetype": "float",
+    "fourier_degrees": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "interactions": [
+      [
+        0,
+        1
+      ],
+      [
+        2,
+        3
+      ]
+    ],
+    "use_physical_guidance": true,
+    "num_reference_points": 4,
+    "reference_feature_start": 4,
+    "reference_feature_stride": 3,
+    "time_feature_index": 0,
+    "frequency_feature_index": 1,
+    "target_coord_indices": [
+      2,
+      3
+    ],
+    "time_fourier_order": 5,
+    "frequency_fourier_order": 5,
+    "time_fourier_scale": 6.283185307179586,
+    "frequency_fourier_scale": 6.283185307179586
+  },
+  "best_loss": -1765534.25,
+  "best_epoch": 995,
+  "elapsed_seconds": 2499.145396232605,
+  "early_stopping": {
+    "enabled": true,
+    "patience": 10,
+    "tol": 1e-07,
+    "triggered": false,
+    "stop_epoch": 1000
+  }
+}

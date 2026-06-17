@@ -1,0 +1,696 @@
+# Copyright 2024 The bayesnf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""API for Bayesian Neural Field estimators."""
+
+from collections.abc import Sequence
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+import tensorflow_probability.substrates.jax as tfp
+
+import inference
+import models
+
+tfd = tfp.distributions
+
+
+def seasonality_to_float(seasonality: str, freq: str) -> float:
+  """Convert a valid pandas frequency string to a float, relative `freq`.
+
+  Internally, this computes the number of `freq`s in a long period (to
+  account for leap years), and the number of `seasonality`s, and returns the
+  ratio.
+
+  For example
+  ```
+  >>> seasonality_to_float('Y', 'D') == 365.25
+  >>> seasonality_to_float('Y', 'W') == 52.25
+  >>> seasonality_to_float('M', 'D') == 30.4375
+  ```
+
+  Args:
+    seasonality: A valid pandas frequency.
+    freq: A valid pandas frequency. Should be shorter than `seasonality`.
+
+  Returns:
+    A float of how many `seasonality` periods are in a `freq`, on average.
+  """
+  four_years = pd.date_range('2020-01-01', periods=5, freq='YS')
+  y = four_years.to_period(seasonality)
+  num_seasonality = (y[-1] - y[0]).n
+
+  x = pd.date_range(y[0].start_time, y[-1].start_time).to_period(freq)
+  num_freq = (x[-1] - x[0]).n
+
+  return num_freq / num_seasonality
+
+
+def seasonalities_to_array(
+    seasonalities: Sequence[float | str],
+    freq: str
+    ) -> np.ndarray:
+  """Convert a list of floats or strings to durations relative to a frequency.
+
+  Args:
+    seasonalities: A list of floats or strings representing durations relative
+      to `freq`. For example, if `freq` is 'D', either 365 or 'Y' would
+      represent a year. If `freq` is 'M', then either 12 or 'Y' represents a
+      year.
+    freq: Frequency of the data.
+
+  Raises:
+    TypeError: If the seasonality is less than or equal to 1.
+
+  Returns:
+    Array of floats greater than 1, representing seasonalities.
+  """
+  ret = []
+  for seasonality in seasonalities:
+    if isinstance(seasonality, str):
+      seasonality_float = seasonality_to_float(seasonality, freq)
+      if seasonality_float < 1:
+        raise TypeError(f'{seasonality=} should represent a time '
+                        f'span greater than {freq=}, but {seasonality} '
+                        f'is {seasonality_float:.2f} of a {freq}')
+
+    else:
+      seasonality_float = seasonality
+      if seasonality_float < 1:
+        raise TypeError(f'{seasonality_float=} should be larger than 1.')
+    ret.append(seasonality_float)
+  return np.array(ret)
+
+
+def _convert_datetime_col(table, time_column, timetype, freq, time_min=None):
+  """Converts a time column in place according to the frequency."""
+  if timetype == 'index':
+    first_date = pd.to_datetime('2020-01-01').to_period(freq)
+    table[time_column] = table[time_column].dt.to_period(freq)
+    table[time_column] = (table[time_column] - first_date).apply(lambda x: x.n)
+  elif timetype == 'float':
+    table[time_column] = table[time_column].apply(float)
+  else:
+    raise ValueError(f'Unknown timetype: {timetype}')
+  if time_min is None:
+    time_min = table[time_column].min()
+  table[time_column] = table[time_column] - time_min
+  return table, time_min
+
+
+class SpatiotemporalDataHandler:
+  """Base class for preparing spatiotemporal data."""
+
+  def __init__(
+      self,
+      feature_cols: Sequence[str],
+      target_col: str,
+      timetype: str,
+      freq: str,
+      standardize: Sequence[str] | None = None,
+  ):
+    self.feature_cols = feature_cols
+    self.target_col = target_col
+    self.timetype = timetype
+    self.freq = freq
+    self.standardize = standardize
+    self.mu_ = None
+    self.std_ = None
+    self.time_min_ = None
+    self.time_scale_ = None
+    self.input_scales_ = None
+
+  @property
+  def _time_idx(self) -> int:
+    return 0
+
+  @property
+  def _time_column(self) -> str:
+    return self.feature_cols[self._time_idx]
+
+  def get_target(self, table: pd.DataFrame) -> np.ndarray:
+    table = self._maybe_filter_target_nans(table)
+    return table[self.target_col].values
+
+  def _maybe_filter_target_nans(self, table: pd.DataFrame) -> pd.DataFrame:
+    if self.target_col in table.columns:
+      return table[table[self.target_col].notna()]
+    return table
+
+  def copy_and_filter_table(self, table: pd.DataFrame) -> pd.DataFrame:
+    return self._maybe_filter_target_nans(table.copy())
+
+  def get_train(self, table: pd.DataFrame) -> np.ndarray:
+    """Fetch training data."""
+    table = self.copy_and_filter_table(table)
+    self.mu_ = np.zeros(len(self.feature_cols))
+    self.std_ = np.ones(len(self.feature_cols))
+
+    table, self.time_min_ = _convert_datetime_col(
+        table, self._time_column, self.timetype, self.freq, None)
+    features = table[self.feature_cols].values.astype(float)
+
+    if self.standardize:
+      if self._time_column in self.standardize:
+        raise TypeError('Do not standardize the time column!')
+      idx = [self.feature_cols.index(f) for f in self.standardize]
+      self.mu_[idx] = np.mean(features[:, idx].astype(float), axis=0)
+      self.std_[idx] = np.std(features[:, idx].astype(float), axis=0)
+      self.std_[idx] = np.where(self.std_[idx] < 1e-6, 1.0, self.std_[idx])
+      features = (features - self.mu_) / self.std_
+
+    self.input_scales_ = np.nanmax(np.abs(features), axis=0)
+    self.input_scales_ = np.where(
+        self.input_scales_ < 1e-6, 1.0, self.input_scales_
+    )
+    self.time_scale_ = self.input_scales_[self._time_idx]
+
+    return features
+
+  def get_test(self, table: pd.DataFrame) -> np.ndarray:
+    """Fetch testing data. Call this after `get_train`."""
+    table = table.copy()
+    table, _ = _convert_datetime_col(
+        table, self._time_column, self.timetype, self.freq, self.time_min_)
+
+    features = table[self.feature_cols].values.astype(float)
+
+    if self.standardize:
+      features = (features - self.mu_) / self.std_
+
+    return features
+
+  def get_input_scales(self) -> np.ndarray:
+    if self.input_scales_ is not None:
+      return np.asarray(self.input_scales_, dtype=float)
+    input_scales = np.ones(len(self.feature_cols))
+    if self.time_scale_ is not None:
+      input_scales[self._time_idx] = self.time_scale_
+    return input_scales
+
+
+class BayesianNeuralFieldEstimator:
+  """Base class for BayesNF estimators.
+
+  This class should not be initialized directly, but rather one of the three
+  subclasses that implement different model learning procedures:
+
+  - [BayesianNeuralFieldVI](BayesianNeuralFieldVI.md), for
+    ensembles of surrogate posteriors from variational inference.
+
+  - [BayesianNeuralFieldMAP](BayesianNeuralFieldMAP.md), for
+    stochastic ensembles of maximum-a-posteriori estimates.
+
+  - [BayesianNeuralFieldMLE](BayesianNeuralFieldMLE.md), for
+    stochastic ensembles of maximum likelihood estimates.
+
+  All three classes share the same `__init__` method described below.
+  """
+
+  _ensemble_dims: int
+  _prior_weight: float = 1.0
+  _scale_epochs_by_batch_size: bool = False
+
+  def __init__(
+      self,
+      *,
+      feature_cols: Sequence[str],
+      target_col: str,
+      seasonality_periods: Sequence[float | str] | None = None,
+      num_seasonal_harmonics: Sequence[int] | None = None,
+      fourier_degrees: Sequence[float] | None = None,
+      interactions: Sequence[tuple[int, int]] | None = None,
+      freq: str | None = None,
+      timetype: str = 'index',
+      depth: int = 2,
+      width: int = 512,
+      observation_model: str = 'NORMAL',
+      standardize: Sequence[str] | None = None,
+      use_physical_guidance: bool = True,
+      num_reference_points: int | None = None,
+      reference_feature_start: int = 4,
+      reference_feature_stride: int = 3,
+      time_feature_index: int = 0,
+      frequency_feature_index: int = 1,
+      target_coord_indices: tuple[int, int] = (2, 3),
+      time_fourier_order: int = 5,
+      frequency_fourier_order: int = 5,
+      time_fourier_scale: float = 2 * np.pi,
+      frequency_fourier_scale: float = 2 * np.pi,
+      ):
+    """Shared initialization for subclasses of BayesianNeuralFieldEstimator.
+
+    Args:
+      feature_cols: Names of columns to use as features in the training data
+        frame. The first entry denotes the name of the time variable, the
+        remaining entries (if any) denote names of the spatial features.
+      target_col: Name of the target column representing the spatial field.
+      seasonality_periods: A list of numbers representing the seasonal
+        frequencies of the data in the time domain. If timetype == 'index', then
+        it is possible to specify numeric frequencies by using string short
+        hands such as 'W', 'D', etc., which correspond to a valid Pandas
+        frequency. See Pandas [Offset
+        Aliases](https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases)
+        for valid string values.
+      num_seasonal_harmonics: A list of seasonal harmonics, one for each entry
+        in `seasonality_periods`. The number of seasonal harmonics (h) for a
+        given seasonal period `p` must satisfy `h < p//2`. It is an error fir
+        `len(num_seasonal_harmonics) != len(seasonality_periods)`. Should be
+        used only if `timetype == 'index'`.
+      fourier_degrees: A list of integer degrees for the Fourier features of the
+        inputs. If given, must have the same length as `feature_cols`.
+      interactions: A list of tuples of column indexes for the first-order
+        interactions. For example `[(0,1), (1,2)]` creates two interaction
+        features  - `feature_cols[0] * feature_cols[1]` - `feature_cols[1] *
+        feature_cols[2]`
+      freq: A frequency string for the sampling rate at which the data is
+        collected. See the Pandas [Offset
+        Aliases](https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases)
+        for valid values. Should be used if and only if `timetype == 'index'`.
+      timetype: Either `index` or `float`. If `index`, then the time column must
+        be a `datetime` type and `freq` must be given. Otherwise, if `float`,
+        then the time column must be `float`.
+      depth: The number of hidden layers in the BayesNF architecture.
+      width: The number of hidden units in each layer.
+      observation_model: The aleatoric noise model for the observed data. The
+        options are `NORMAL` (Gaussian noise), `NB` (negative binomial noise),
+        or `ZNB` (zero-inflated negative binomial noise).
+      standardize: List of columns that should be standardized. It is highly
+        recommended to standardize `feature_cols[1:]`. It is an error if
+        `features_cols[0]` (the time variable) is in `standardize`.
+    """
+    self.num_seasonal_harmonics = num_seasonal_harmonics
+    self.seasonality_periods = seasonality_periods
+    self.observation_model = observation_model
+    self.depth = depth
+    self.width = width
+    self.feature_cols = feature_cols
+    self.target_col = target_col
+    self.timetype = timetype
+    self.freq = freq
+    self.fourier_degrees = fourier_degrees
+    self.standardize = standardize
+    self.interactions = interactions
+    self.use_physical_guidance = use_physical_guidance
+    self.reference_feature_start = reference_feature_start
+    self.reference_feature_stride = reference_feature_stride
+    self.time_feature_index = time_feature_index
+    self.frequency_feature_index = frequency_feature_index
+    self.target_coord_indices = target_coord_indices
+    self.time_fourier_order = time_fourier_order
+    self.frequency_fourier_order = frequency_fourier_order
+    self.time_fourier_scale = time_fourier_scale
+    self.frequency_fourier_scale = frequency_fourier_scale
+    if num_reference_points is None and use_physical_guidance:
+      remaining_features = len(feature_cols) - reference_feature_start
+      num_reference_points = max(
+          0, remaining_features // reference_feature_stride
+      )
+    self.num_reference_points = num_reference_points or 0
+
+    self.losses_ = None
+    self.params_ = None
+    self.data_handler = SpatiotemporalDataHandler(
+        self.feature_cols,
+        self.target_col,
+        self.timetype,
+        self.freq,
+        standardize=self.standardize)
+
+  def _get_fourier_degrees(self, batch_shape: tuple[int, ...]) -> np.ndarray:
+    """Set default fourier degrees, or verify shape is correct."""
+    if self.fourier_degrees is None:
+      fourier_degrees = np.full(batch_shape[-1], 5, dtype=int)
+    else:
+      fourier_degrees = np.atleast_1d(self.fourier_degrees).astype(int)
+      if fourier_degrees.shape[-1] != batch_shape[-1]:
+        raise ValueError(
+            'The length of fourier_degrees ({}) must match the '
+            'input dimension dimension ({}).'.format(
+                fourier_degrees.shape[-1], batch_shape[-1]
+            )
+        )
+    return fourier_degrees
+
+  def _get_interactions(self) -> np.ndarray:
+    """Set default fourier degrees, or verify shape is correct."""
+    if self.interactions is None:
+      interactions = np.zeros((0, 2), dtype=int)
+    else:
+      interactions = np.array(self.interactions).astype(int)
+      if np.ndim(interactions) != 2 or interactions.shape[-1] != 2:
+        raise ValueError(
+            'The argument for `interactions` should be a 2-d array of integers '
+            'of shape (N, 2), indicating the column indices to interact (the '
+            f' passed shape was {interactions.shape})')
+    return interactions
+
+  def _get_seasonality_periods(self):
+    """Return array of seasonal periods."""
+    if (
+        (self.timetype == 'index' and self.freq is None) or
+        (self.timetype == 'float' and self.freq is not None)):
+      raise ValueError(f'Invalid {self.freq=} with {self.timetype=}.')
+    if self.seasonality_periods is None:
+      return np.zeros(0)
+    if self.timetype == 'index':
+      return seasonalities_to_array(self.seasonality_periods, self.freq)
+    if self.timetype == 'float':
+      return np.asarray(self.seasonality_periods, dtype=float)
+    assert False, f'Impossible {self.timetype=}.'
+
+  def _get_num_seasonal_harmonics(self):
+    """Return array of seasonal harmonics per seasonal period."""
+    # Discrete time.
+    if self.timetype == 'index':
+      return (
+          np.array(self.num_seasonal_harmonics)
+          if self.num_seasonal_harmonics is not None else
+          np.zeros(0))
+    # Continuous time.
+    if self.timetype == 'float':
+      if self.num_seasonal_harmonics is not None:
+        raise ValueError(
+            f'Cannot use num_seasonal_harmonics with {self.timetype=}.'
+        )
+      # HACK: models.make_seasonal_frequencies assumes the data is discrete
+      # time where each harmonic h is between 1, ..., p/2 and the harmonic
+      # factors are np.arange(1, h + 1). Since our goal with continuous
+      # time data is exactly 1 harmonic per seasonal factor, any h between
+      # 0 and min(0.5, p/2) will work, as np.arange(1, 1+h) = [1]
+      return np.fmin(.5, self._get_seasonality_periods() / 2)
+    assert False, f'Impossible {self.timetype=}.'
+
+  def _model_args(self, batch_shape):
+    return {
+        'depth': self.depth,
+        'input_scales': self.data_handler.get_input_scales(),
+        'num_seasonal_harmonics': self._get_num_seasonal_harmonics(),
+        'seasonality_periods': self._get_seasonality_periods(),
+        'width': self.width,
+        'init_x': batch_shape,
+        'fourier_degrees': self._get_fourier_degrees(batch_shape),
+        'interactions': self._get_interactions(),
+        'use_physical_guidance': self.use_physical_guidance,
+        'num_reference_points': self.num_reference_points,
+        'reference_feature_start': self.reference_feature_start,
+        'reference_feature_stride': self.reference_feature_stride,
+        'time_feature_index': self.time_feature_index,
+        'frequency_feature_index': self.frequency_feature_index,
+        'target_coord_indices': self.target_coord_indices,
+        'time_fourier_order': self.time_fourier_order,
+        'frequency_fourier_order': self.frequency_fourier_order,
+        'time_fourier_scale': self.time_fourier_scale,
+        'frequency_fourier_scale': self.frequency_fourier_scale,
+    }
+
+  def predict(self, table, quantiles=(0.5,), approximate_quantiles=False):
+    """Make predictions of the target column at new times.
+
+    Args:
+      table (pandas.DataFrame):
+        Field locations at which to make new predictions. Same as `table` in
+        [`fit`](), except that `self.target_col` need not be in `table`.
+
+      quantiles (Sequence[float]):
+        The list of quantiles to compute.
+
+      approximate_quantiles (bool):
+        If `False,` uses Chandrupatla root finding to compute quantiles.
+        If `True`, uses a heuristic approximation of the quantiles.
+
+    Returns:
+      means (np.ndarray):
+        The predicted means from each particle in the learned ensemble.
+        The shape is `(num_devices, ensemble_size // num_devices, len(table))`
+        and can be flattened to a 2D array using `np.row_stack(means)`.
+        Related https://github.com/google/bayesnf/issues/17
+
+      quantiles (List[np.ndarray]):
+        A list of numpy arrays, one per requested quantile.
+        The length of each array in the list is `len(table)`.
+
+    """
+    test_data = self.data_handler.get_test(table)
+    return inference.predict_bnf(
+        test_data,
+        self.observation_model,
+        params=self.params_,
+        model_args=self._model_args(test_data.shape),
+        quantiles=quantiles,
+        ensemble_dims=self._ensemble_dims,
+        approximate_quantiles=approximate_quantiles,
+    )
+
+  def fit(self, table, seed):
+    """Run inference given a training data `table` and `seed`.
+
+    Cannot be directly called on `BayesianNeuralFieldEstimator`.
+
+    Args:
+      table (pandas.DataFrame):
+        A pandas DataFrame representing the
+        training data. It has the following requirements:
+
+        - The columns of `table` should contain all `self.feature_cols`
+          and the `self.target_col`.
+
+        - The type of the "time" column (i.e., `self.feature_cols[0]`)
+          should be `datetime`. To ensure this requirement holds, see
+          [`pandas.to_datetime`](
+          https://pandas.pydata.org/docs/reference/api/pandas.to_datetime.html).
+          The types of the remaining feature columns should be numeric.
+
+      seed (jax.random.PRNGKey): The jax random key.
+    """
+    raise NotImplementedError('Should be implemented by subclass')
+
+  def likelihood_model(self, table: pd.DataFrame) -> tfd.Distribution:
+    """Access the predictive distribution over new field values in `table`.
+
+    NOTE: Must be called after [`fit`]().
+
+    Args:
+      table (pandas.DataFrame):
+        Field locations at which to make new predictions. Same as `table` in
+        [`fit`](), except that `self.target_col` need not be in `table`.
+
+    Returns:
+      A probability distribution representing the predictive distribution
+        over `self.target_col` at the new field values in `table`.
+        See [tfp.distributions.Distribution](
+        https://www.tensorflow.org/probability/api_docs/python/tfp/distributions/Distribution)
+        for the methods associated with this object.
+    """
+    test_data = self.data_handler.get_test(table)
+    mlp, mlp_template = inference.make_model(
+        **self._model_args(test_data.shape))
+    for _ in range(self._ensemble_dims - 1):
+      mlp.apply = jax.vmap(mlp.apply, in_axes=(0, None))
+    mlp.apply = jax.pmap(mlp.apply, in_axes=(0, None))
+
+    # This allows the likelihood to broadcast correctly with the batch of
+    # predictions.
+    params = self.params_._replace(**{  # pytype: disable=attribute-error
+        self.params_._fields[i]: self.params_[i][..., jnp.newaxis]  # pytype: disable=unsupported-operands,attribute-error
+        for i in range(3)})
+
+    return models.make_likelihood_model(
+        params,
+        jnp.array(test_data),
+        mlp,
+        mlp_template,
+        self.observation_model)
+
+
+class BayesianNeuralFieldMAP(BayesianNeuralFieldEstimator):
+  """Fits models using stochastic ensembles of maximum-a-posteriori estimates.
+
+  Implementation of
+  [BayesianNeuralFieldEstimator](BayesianNeuralFieldEstimator.md).
+  """
+
+  _ensemble_dims = 2
+
+  def fit(
+      self,
+      table,
+      seed,
+      ensemble_size=16,
+      learning_rate=0.005,
+      num_epochs=5_000,
+      batch_size=None,
+      num_splits=1,
+      ) -> BayesianNeuralFieldEstimator:
+    """Run inference using stochastic MAP ensembles.
+
+    Args:
+      table (pandas.DataFrame):
+        See documentation of
+        [`table`][bayesnf.spatiotemporal.BayesianNeuralFieldEstimator.fit]
+        in the base class.
+
+      seed (jax.random.PRNGKey): The jax random key.
+
+      ensemble_size (int): Number of particles in the ensemble. It currently
+        an error if `ensemble_size < jax.device_count`, but will be fixed
+        in https://github.com/google/bayesnf/issues/28.
+
+
+      learning_rate (float): Learning rate for SGD.
+
+      num_epochs (int): Number of full epochs through the training data.
+
+      batch_size (None | int): Batch size for SGD. Default is `None`,
+        meaning full-batch. Each epoch will perform `len(table) // batch_size`
+        SGD updates.
+
+      num_splits (int): Number of splits over the data to run training.
+        Defaults to 1, meaning there are no splits.
+
+    Returns:
+      Instance of `self`.
+    """
+    if ensemble_size < jax.device_count():
+      raise ValueError('ensemble_size cannot be smaller than device_count. '
+                       'https://github.com/google/bayesnf/issues/28.')
+    train_data = self.data_handler.get_train(table)
+    train_target = self.data_handler.get_target(table)
+    if batch_size is None:
+      batch_size = train_data.shape[0]
+    if self._scale_epochs_by_batch_size:
+      num_epochs = num_epochs * (train_data.shape[0] // batch_size)
+    model_args = self._model_args((batch_size, train_data.shape[-1]))
+    self.params_, self.losses_ = inference.fit_map(
+        train_data,
+        train_target,
+        seed=seed,
+        observation_model=self.observation_model,
+        model_args=model_args,
+        num_particles=ensemble_size,
+        learning_rate=learning_rate,
+        num_epochs=num_epochs,
+        prior_weight=self._prior_weight,
+        batch_size=batch_size,
+        num_splits=num_splits)
+    return self
+
+
+class BayesianNeuralFieldMLE(BayesianNeuralFieldMAP):
+  """Fits models using stochastic ensembles of maximum likelihood estimates.
+
+  Implementation of
+  [BayesianNeuralFieldEstimator](BayesianNeuralFieldEstimator.md).
+  """
+
+  _prior_weight = 0.0
+
+
+class BayesianNeuralFieldVI(BayesianNeuralFieldEstimator):
+  """Fits models using stochastic ensembles of surrogate posteriors from VI.
+
+  Implementation of
+  [BayesianNeuralFieldEstimator](BayesianNeuralFieldEstimator.md) using
+  variational inference (VI).
+  """
+
+  _ensemble_dims = 3
+  _scale_epochs_by_batch_size = True
+
+  def fit(
+      self,
+      table,
+      seed,
+      ensemble_size=16,
+      learning_rate=0.01,
+      num_epochs=1_000,
+      sample_size_posterior=30,
+      sample_size_divergence=5,
+      kl_weight=0.1,
+      batch_size=None,
+      ) -> BayesianNeuralFieldEstimator:
+    """Run inference using stochastic variational inference ensembles.
+
+    Args:
+      table (pandas.DataFrame):
+        See documentation of
+        [`table`][bayesnf.spatiotemporal.BayesianNeuralFieldEstimator.fit]
+        in the base class.
+
+      seed (jax.random.PRNGKey): The jax random key.
+
+      ensemble_size (int): Number of particles (i.e., surrogate posteriors)
+        in the ensemble, **per device**. The available devices can be found
+        via `jax.devices()`.
+
+      learning_rate (float): Learning rate for SGD.
+
+      num_epochs (int): Number of full epochs through the training data.
+
+      sample_size_posterior (int): Number of samples of "posterior" model
+        parameters draw from each surrogate posterior when making
+        predictions.
+
+      sample_size_divergence (int): number of Monte Carlo samples to use in
+        estimating the variational divergence. Larger values may stabilize
+        the optimization, but at higher cost per step in time and memory.
+        See [`tfp.vi.fit_surrogate_posterior_stateless`](
+        https://www.tensorflow.org/probability/api_docs/python/tfp/vi/fit_surrogate_posterior_stateless)
+        for further details.
+
+      kl_weight (float): Weighting of the KL divergence term in VI. The
+        goal is to find a surrogate posterior `q(z)` that maximizes a
+        version of the ELBO with the `KL(surrogate posterior || prior)`
+        term scaled by `kl_weight`
+
+            E_z~q [log p(x|z)] - kl_weight * KL(q || p)
+
+        Reference
+        > Weight Uncertainty in Neural Network
+        > Charles Blundell, Julien Cornebise, Koray Kavukcuoglu, Daan Wierstra.
+        > Proceedings of the 32nd International Conference on Machine Learning.
+        > PMLR 37:1613-1622, 2015.
+        > <https://proceedings.mlr.press/v37/blundell15>
+
+      batch_size (None | int): If specified, the log probability in each
+        step of variational inference  is computed on a batch of this size.
+        Default is `None`, meaning full-batch.
+
+    Returns:
+      Instance of self.
+    """
+    train_data = self.data_handler.get_train(table)
+    train_target = self.data_handler.get_target(table)
+    if batch_size is None:
+      batch_size = train_data.shape[0]
+    if self._scale_epochs_by_batch_size:
+      num_epochs = num_epochs * (train_data.shape[0] // batch_size)
+    model_args = self._model_args((batch_size, train_data.shape[-1]))
+    _, self.losses_, self.params_ = inference.fit_vi(
+        train_data,
+        train_target,
+        seed=seed,
+        observation_model=self.observation_model,
+        model_args=model_args,
+        ensemble_size=ensemble_size,
+        learning_rate=learning_rate,
+        num_epochs=num_epochs,
+        sample_size_posterior=sample_size_posterior,
+        sample_size_divergence=sample_size_divergence,
+        kl_weight=kl_weight,
+        batch_size=batch_size,
+    )
+    return self
